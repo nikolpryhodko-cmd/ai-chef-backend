@@ -202,3 +202,8 @@ async def _consume_slot_or_409(user_id: str) -> None:
         await user_service.consume_generation_slot(user_id)
     except user_service.LimitExceededError as exc:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+@app.post("/api/v1/telegram/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    # Здесь сервер принимает сообщения от Telegram
+    return {"ok": True}
