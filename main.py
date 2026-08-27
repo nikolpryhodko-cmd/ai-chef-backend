@@ -268,7 +268,12 @@ async def telegram_webhook(request: Request):
 
         try:
             # Ensure user exists (and give referral bonus if provided)
-            reg = UserRegisterRequest(external_id=str(tg_user_id), source="telegram", referral_code=referral)
+            # Pass exactly the fields expected by user_service.get_or_create_user
+            reg = UserRegisterRequest(
+                external_id=str(tg_user_id),
+                source="telegram",
+                referral_code=referral,
+            )
             profile = await user_service.get_or_create_user(reg)
             welcome = (
                 "Привет! Я — AI Chef. Я помогу готовить из того, что у вас есть.\n\n"
@@ -279,8 +284,14 @@ async def telegram_webhook(request: Request):
             )
             # Use language from profile to make simple short reply — here we keep a neutral RU message.
             await _send_message(welcome)
-        except Exception:
-            logger.exception("Registration or welcome failed")
+        except Exception as exc:
+            # Log the full exception details and the registration payload so Render logs show the root cause
+            logger.exception(
+                "Registration or welcome failed while creating user external_id=%s referral=%s: %s",
+                tg_user_id,
+                referral,
+                exc,
+            )
             await _send_message("Ошибка при регистрации. Пожалуйста, попробуйте позже.")
         return {"ok": True}
 
@@ -316,8 +327,8 @@ async def telegram_webhook(request: Request):
                 f"Сброс в: {status.resets_at}"
             )
             await _send_message(usage_text)
-        except Exception:
-            logger.exception("Failed to fetch usage status")
+        except Exception as exc:
+            logger.exception("Failed to fetch usage status for telegram_id=%s: %s", tg_user_id, exc)
             await _send_message("Ошибка при получении статуса использования. Попробуйте позже.")
         return {"ok": True}
 
