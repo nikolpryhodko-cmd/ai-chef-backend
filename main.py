@@ -204,6 +204,123 @@ async def _consume_slot_or_409(user_id: str) -> None:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
 @app.post("/api/v1/telegram/webhook")
 async def telegram_webhook(request: Request):
+    """
+    Telegram webhook handler.
+
+    Supported:
+    - /start [referral]  — registers the user (if needed) and replies with a welcome message.
+    - /help              — shows available commands.
+    - /usage             — shows today's usage status for the caller (creates user if missing).
+    Any other text => short help reply.
+
+    Replies are sent via Telegram Bot API using settings.TELEGRAM_BOT_TOKEN.
+    """
+    import httpx
+
     data = await request.json()
-    # Здесь сервер принимает сообщения от Telegram
+    logger.info("Telegram webhook received: %s", {"update": data.get("update_id")})
+
+    # Accept several common update shapes
+    message = data.get("message") or data.get("edited_message") or data.get("channel_post")
+    if not message:
+        # nothing to do (inline_query, callback_query etc. could be handled later)
+        return {"ok": True}
+
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = message.get("text") or message.get("caption") or ""
+    from_user = message.get("from", {}) or {}
+    tg_user_id = from_user.get("id")
+
+    if not chat_id:
+        return {"ok": True}
+
+    token = settings.TELEGRAM_BOT_TOKEN
+    if not token:
+        logger.warning("TELEGRAM_BOT_TOKEN not configured; webhook will not send replies")
+        return {"ok": True}
+
+    async def _send_message(text_to_send: str):
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text_to_send,
+            "disable_web_page_preview": True,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+        except Exception:
+            logger.exception("Failed to send message to Telegram")
+
+    text = (text or "").strip()
+
+    # Handle /start (optionally with referral code): "/start REF123"
+    if text.startswith("/start"):
+        # Telegram may send "/start <payload>" — treat second token as referral external_id
+        parts = text.split(maxsplit=1)
+        referral = parts[1].strip() if len(parts) > 1 else None
+
+        if not tg_user_id:
+            await _send_message("Не удалось определить ваш Telegram ID. Попробуйте ещё раз.")
+            return {"ok": True}
+
+        try:
+            # Ensure user exists (and give referral bonus if provided)
+            reg = UserRegisterRequest(external_id=str(tg_user_id), source="telegram", referral_code=referral)
+            profile = await user_service.get_or_create_user(reg)
+            welcome = (
+                "Привет! Я — AI Chef. Я помогу готовить из того, что у вас есть.\n\n"
+                "Доступные команды:\n"
+                "/help — список команд\n"
+                "/usage — сколько осталось бесплатных генераций сегодня\n\n"
+                "Если хотите — пришлите фото ингредиентов (через бота) или используйте мобильное приложение."
+            )
+            # Use language from profile to make simple short reply — here we keep a neutral RU message.
+            await _send_message(welcome)
+        except Exception:
+            logger.exception("Registration or welcome failed")
+            await _send_message("Ошибка при регистрации. Пожалуйста, попробуйте позже.")
+        return {"ok": True}
+
+    # Help
+    if text.startswith("/help"):
+        help_text = (
+            "Список команд:\n"
+            "/start [referral] — зарегистрироваться (при первом запуске)\n"
+            "/help — показать это сообщение\n"
+            "/usage — узнать оставшиеся бесплатные генерации сегодня\n\n"
+            "Пока бот не умеет принимать произвольный текст для генерации рецепта. "
+            "Чтобы генерировать рецепт, используйте мобильное приложение или интеграцию, "
+            "либо пришлите фото ингредиентов (если бот настроен на приём файлов)."
+        )
+        await _send_message(help_text)
+        return {"ok": True}
+
+    # Usage status
+    if text.startswith("/usage"):
+        if not tg_user_id:
+            await _send_message("Не удалось определить ваш Telegram ID.")
+            return {"ok": True}
+        try:
+            reg = UserRegisterRequest(external_id=str(tg_user_id), source="telegram")
+            profile = await user_service.get_or_create_user(reg)
+            status = await user_service.get_usage_status(profile.id)
+            usage_text = (
+                f"Статус использования на {status.date}:\n"
+                f"Использовано: {status.used_today}\n"
+                f"Ежедневный лимит: {status.daily_limit}\n"
+                f"Бонусные запросы: {status.bonus_requests}\n"
+                f"Осталось: {status.remaining}\n"
+                f"Сброс в: {status.resets_at}"
+            )
+            await _send_message(usage_text)
+        except Exception:
+            logger.exception("Failed to fetch usage status")
+            await _send_message("Ошибка при получении статуса использования. Попробуйте позже.")
+        return {"ok": True}
+
+    # Default reply for unsupported messages
+    await _send_message("Я пока поддерживаю только базовые команды. Отправьте /help для списка команд.")
     return {"ok": True}
