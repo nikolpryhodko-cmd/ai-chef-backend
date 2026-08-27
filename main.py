@@ -219,18 +219,67 @@ async def telegram_webhook(request: Request):
 
     data = await request.json()
     logger.info("Telegram webhook received: %s", {"update": data.get("update_id")})
+    logger.info("Telegram update keys: %s", list(data.keys()))
 
     # Accept several common update shapes
     message = data.get("message") or data.get("edited_message") or data.get("channel_post")
+    callback_query = data.get("callback_query")
+    my_chat_member = data.get("my_chat_member") or data.get("chat_member")
+
+    # If it's a callback_query (inline button), the user text/command may be in callback_query['data']
+    if not message and callback_query:
+        message = callback_query.get("message") or {}
+        if callback_query.get("data"):
+            # put callback data into the message text so existing handlers continue to work
+            message["text"] = callback_query["data"]
+
+    # If it's a my_chat_member/chat_member update (bot added/started), attempt to register the user
+    if not message and my_chat_member:
+        logger.info("Received my_chat_member/chat_member update: %s", my_chat_member)
+        chat = my_chat_member.get("chat", {})
+        chat_id = chat.get("id")
+        # In private chats the chat_id equals the user's Telegram ID; create the user record proactively
+        if chat_id:
+            tg_user_id = chat_id
+            token = settings.TELEGRAM_BOT_TOKEN
+            if token:
+                async def _send_message_local(text_to_send: str):
+                    url = f"https://api.telegram.org/bot{token}/sendMessage"
+                    payload = {"chat_id": chat_id, "text": text_to_send, "disable_web_page_preview": True}
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            resp = await client.post(url, json=payload)
+                            resp.raise_for_status()
+                    except Exception:
+                        logger.exception("Failed to send message to Telegram (my_chat_member welcome)")
+
+                try:
+                    reg = UserRegisterRequest(external_id=str(tg_user_id), source="telegram")
+                    profile = await user_service.get_or_create_user(reg)
+                    welcome = (
+                        "Привет! Я — AI Chef. Я помогу готовить из того, что у вас есть.\n\n"
+                        "Доступные команды:\n"
+                        "/help — список команд\n"
+                        "/usage — сколько осталось бесплатных генераций сегодня\n\n"
+                        "Если хотите — пришлите фото ингредиентов (через бота) или используйте мобильное приложение."
+                    )
+                    await _send_message_local(welcome)
+                except Exception as exc:
+                    logger.exception("Registration from my_chat_member failed for id=%s: %s", tg_user_id, exc)
+            return {"ok": True}
+
     if not message:
-        # nothing to do (inline_query, callback_query etc. could be handled later)
+        # nothing to do (inline_query, callback_query without message, etc.)
         return {"ok": True}
 
     chat = message.get("chat", {})
     chat_id = chat.get("id")
     text = message.get("text") or message.get("caption") or ""
     from_user = message.get("from", {}) or {}
-    tg_user_id = from_user.get("id")
+    tg_user_id = from_user.get("id") or chat.get("id")
+
+    # Log the normalized text and sender so we can see why commands didn't match
+    logger.info("Telegram normalized text=%r from_user_id=%r chat_id=%r", text, tg_user_id, chat_id)
 
     if not chat_id:
         return {"ok": True}
@@ -288,7 +337,7 @@ async def telegram_webhook(request: Request):
             # Log the full exception details and the registration payload so Render logs show the root cause
             logger.exception(
                 "Registration or welcome failed while creating user external_id=%s referral=%s: %s",
-                tg_user_id,
+                str(tg_user_id),
                 referral,
                 exc,
             )
@@ -328,7 +377,7 @@ async def telegram_webhook(request: Request):
             )
             await _send_message(usage_text)
         except Exception as exc:
-            logger.exception("Failed to fetch usage status for telegram_id=%s: %s", tg_user_id, exc)
+            logger.exception("Failed to fetch usage status for telegram_id=%s: %s", str(tg_user_id), exc)
             await _send_message("Ошибка при получении статуса использования. Попробуйте позже.")
         return {"ok": True}
 
